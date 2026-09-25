@@ -72,6 +72,9 @@ type Store struct {
 	activityInputQueries atomic.Int64
 	// activityUsageRows keeps activity usage reads per source, set, and range.
 	activityUsageRows usageRowMemo[*activityUsageKept]
+	// activityUsageRanges keeps every session's prepared usage rows per
+	// range in progress; see activityUsageRange.
+	activityUsageRanges usageRowMemo[activityUsageRange]
 	// keeping tracks the encodes of activity usage reads being kept; see
 	// activityReportUsage. Close waits for them.
 	keeping sync.WaitGroup
@@ -89,8 +92,10 @@ type Store struct {
 	activityChecks usageRowMemo[activityReportCheck]
 	// reportDisk keeps ended ranges' reports on disk; see
 	// openActivityReportDisk. Empty, reports are kept in memory only.
-	reportDisk             activityReportDisk
-	activityUsageQueries   atomic.Int64
+	reportDisk           activityReportDisk
+	activityUsageQueries atomic.Int64
+	// activityUsageRowsRead counts the activity usage rows scanned.
+	activityUsageRowsRead  atomic.Int64
 	activitySessionQueries atomic.Int64
 }
 
@@ -128,6 +133,7 @@ func NewStore(ctx context.Context, t Target) (*Store, error) {
 func NewStoreFromDB(conn *sql.DB) *Store {
 	s := &Store{conn: conn}
 	s.diskReports.limit = activityDiskReportMemoLimit
+	s.activityUsageRanges.limit = activityUsageRangeLimit
 	return s
 }
 
