@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -151,6 +152,8 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 	// complete snapshot. A table prepared by another query may lack the
 	// stamp columns, so it is checked before they are read.
 	if filled == 0 || comment != chPreparedUsageComment() {
+		s.traceUsageReadiness(fmt.Sprintf("not ready: snapshots published=%v, prepared table from this binary=%v",
+			filled != 0, comment == chPreparedUsageComment()))
 		return preparedUsageState{}, nil
 	}
 	var stored usageStamp
@@ -158,6 +161,7 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 		FROM prepared_usage LIMIT 1 SETTINGS final=0`).Scan(
 		&stored.snapshotCount, &stored.snapshotHash, &stored.pricingDigest, &stored.priceCount)
 	if errors.Is(err, sql.ErrNoRows) {
+		s.traceUsageReadiness("not ready: prepared table is empty")
 		return preparedUsageState{}, nil
 	}
 	if err != nil {
@@ -190,6 +194,11 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 		s.coverageCache.mu.Lock()
 		s.coverageCache.fingerprint, s.coverageCache.stamp, s.coverageCache.live = fingerprint, stamp, live
 		s.coverageCache.mu.Unlock()
+	}
+	if live.missing > 0 {
+		s.traceUsageReadiness(fmt.Sprintf("not ready: %d sessions lack a current usage snapshot", live.missing))
+	} else {
+		s.traceUsageReadiness("ready")
 	}
 	state := preparedUsageState{
 		ready:     live.missing == 0,
@@ -559,4 +568,16 @@ type usageCoverage struct {
 	deltaDigest string
 	// revisions maps each session to its current snapshot revision.
 	revisions map[string]string
+}
+
+// traceUsageReadiness logs why prepared usage can or cannot answer reads,
+// once per change.
+func (s *Store) traceUsageReadiness(reason string) {
+	s.readinessTrace.Lock()
+	defer s.readinessTrace.Unlock()
+	if s.readinessTrace.last == reason {
+		return
+	}
+	s.readinessTrace.last = reason
+	log.Printf("clickhouse: activity trace: prepared usage %s", reason)
 }

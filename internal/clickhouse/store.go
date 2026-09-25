@@ -75,6 +75,11 @@ type Store struct {
 	// activityUsageRanges keeps every session's prepared usage rows per
 	// range in progress; see activityUsageRange.
 	activityUsageRanges usageRowMemo[activityUsageRange]
+	// readinessTrace holds the last prepared usage readiness logged.
+	readinessTrace struct {
+		sync.Mutex
+		last string
+	}
 	// keeping tracks the encodes of activity usage reads being kept; see
 	// activityReportUsage. Close waits for them.
 	keeping sync.WaitGroup
