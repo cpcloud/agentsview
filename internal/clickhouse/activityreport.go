@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log"
 	"maps"
 	"slices"
 	"sort"
@@ -547,7 +548,10 @@ func (s *Store) startActivityReportPairs(
 	}
 	go func() {
 		defer close(pairing.done)
+		start, reads := time.Now(), s.activityInputQueries.Load()
 		pairing.paired, pairing.terminal, pairing.err = s.activityReportPairs(ctx, candidates, ids, versions, q)
+		log.Printf("clickhouse: activity trace: pairing sessions=%d input_reads=%d took=%s",
+			len(ids), s.activityInputQueries.Load()-reads, time.Since(start).Round(time.Millisecond))
 	}()
 	return pairing
 }
@@ -799,10 +803,16 @@ func (s *Store) activityReportUsage(
 	// Rows are visited in report order: time, then session, then ordinal.
 	var ordered iter.Seq[*clickActivityReportUsageRow]
 	var count int
+	start, rowsRead := time.Now(), s.activityUsageRowsRead.Load()
+	path := "candidate read"
+	defer func() {
+		log.Printf("clickhouse: activity trace: usage ready=%v partial=%v path=%q rows_read=%d rows=%d took=%s",
+			state.ready, q.Partial, path, s.activityUsageRowsRead.Load()-rowsRead, count, time.Since(start).Round(time.Millisecond))
+	}()
 	if state.ready && q.Partial {
 		// Every push changes a range in progress, so its rows are kept for
 		// every session and a push re-reads only the sessions it changed.
-		kept, err := s.activityUsageRange(ctx, state, lowerBound, upperBound)
+		kept, err := s.activityUsageRange(ctx, state, lowerBound, upperBound, &path)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -824,6 +834,7 @@ func (s *Store) activityReportUsage(
 		}
 		if kept, ok := s.activityUsageRows.get(memoSlot, memoVersion); ok {
 			ordered, count = kept[0].all(), kept[0].count
+			path = "kept raw rows"
 		} else {
 			query, args := clickActivityReportUsageQuery(candidates, lowerBound, upperBound)
 			if state.ready {
@@ -1007,7 +1018,7 @@ const activityUsageRereadSessions = 64
 // revision changed since and merges them in; sessions that are gone drop
 // out. When most sessions changed, one read of the range is cheaper.
 func (s *Store) activityUsageRange(
-	ctx context.Context, state preparedUsageState, lowerBound, upperBound string,
+	ctx context.Context, state preparedUsageState, lowerBound, upperBound string, path *string,
 ) (*activityUsageKept, error) {
 	slot := lowerBound + "|" + upperBound
 	prev, incremental := s.activityUsageRanges.get(slot, "")
@@ -1015,9 +1026,14 @@ func (s *Store) activityUsageRange(
 	if incremental {
 		changed = changedSnapshotSessions(prev[0].revisions, state.revisions)
 		if len(changed) == 0 {
+			*path = "kept range"
 			return prev[0].rows, nil
 		}
 		incremental = len(changed) <= max(activityUsageRereadSessions, len(state.revisions)/4)
+	}
+	*path = "range read"
+	if incremental {
+		*path = fmt.Sprintf("range merge of %d changed sessions", len(changed))
 	}
 	where, args := chPreparedActivityRangeSQL(lowerBound, upperBound)
 	readCtx, err := withUsageDeltaTables(ctx, state)
