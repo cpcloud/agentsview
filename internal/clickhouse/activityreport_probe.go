@@ -117,6 +117,10 @@ type preparedUsageState struct {
 	// and priced under the catalog digest the state's pricingDigest names,
 	// in chPreparedUsageDeltaColumns order.
 	deltaRows [][]any
+	// revisions maps every session with a snapshot to its current snapshot
+	// revision. A ready state's rows for a session are derived from that
+	// snapshot alone, whether stored or in the delta. Shared; not modified.
+	revisions map[string]string
 }
 
 // replaced lists the sessions whose stored prepared rows a read skips: the
@@ -193,6 +197,7 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 		changed:   live.changed,
 		stale:     live.stale,
 		deltaRows: live.deltaRows,
+		revisions: live.revisions,
 	}
 	// The stored records and the delta's must be under the same digest for
 	// a read to take either in place of the join.
@@ -302,6 +307,7 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 	sessions := map[string]uint64{}
 	snapshots := map[string]uint64{}
 	current := map[usageSnapshotKey]bool{}
+	live.revisions = map[string]string{}
 	for rows.Next() {
 		var table uint8
 		var id, revision string
@@ -315,6 +321,7 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 			continue
 		}
 		snapshots[id] = version
+		live.revisions[id] = revision
 		key := usageSnapshotKey{id: id, revision: revision}
 		current[key] = true
 		if hasUsage && !covered[key] {
@@ -550,4 +557,6 @@ type usageCoverage struct {
 	changedKeys []usageSnapshotKey
 	deltaRows   [][]any
 	deltaDigest string
+	// revisions maps each session to its current snapshot revision.
+	revisions map[string]string
 }
