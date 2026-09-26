@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -196,9 +197,10 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 		s.coverageCache.mu.Unlock()
 	}
 	if live.missing > 0 {
-		s.traceUsageReadiness(fmt.Sprintf("not ready: %d sessions lack a current usage snapshot", live.missing))
+		s.traceUsageReadiness(fmt.Sprintf("not ready: %d sessions lack a current usage snapshot (%s)",
+			live.missing, describeHosts(live.hosts)))
 	} else {
-		s.traceUsageReadiness("ready")
+		s.traceUsageReadiness("ready (" + describeHosts(live.hosts) + ")")
 	}
 	state := preparedUsageState{
 		ready:     live.missing == 0,
@@ -305,7 +307,7 @@ func (s *Store) preparedCoveredSnapshots(ctx context.Context, stamp string) (map
 // array sizes come from the size subcolumns, since under FINAL length()
 // reads the arrays.
 func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnapshotKey]bool, live *usageCoverage) error {
-	rows, err := s.queryContext(ctx, `SELECT 0, id, push_version, '', false FROM sessions
+	rows, err := s.queryContext(ctx, `SELECT 0, id, push_version, machine, false FROM sessions
 		UNION ALL
 		SELECT 1, id, push_version, toString(revision),
 			usage_messages.size0 != 0 OR usage_events.size0 != 0 FROM usage_session_snapshots`)
@@ -314,6 +316,7 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 	}
 	defer rows.Close()
 	sessions := map[string]uint64{}
+	machines := map[string]string{}
 	snapshots := map[string]uint64{}
 	current := map[usageSnapshotKey]bool{}
 	live.revisions = map[string]string{}
@@ -326,7 +329,10 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 			return fmt.Errorf("scanning usage coverage: %w", err)
 		}
 		if table == 0 {
+			// The fourth column is the session's machine here and the
+			// snapshot's revision below.
 			sessions[id] = version
+			machines[id] = revision
 			continue
 		}
 		snapshots[id] = version
@@ -341,10 +347,27 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterating usage coverage: %w", err)
 	}
+	live.hosts = map[string]*hostCoverage{}
 	for id, version := range sessions {
-		if snapshot, ok := snapshots[id]; !ok || snapshot < version {
-			live.missing++
+		host := live.hosts[machines[id]]
+		if host == nil {
+			host = &hostCoverage{}
+			live.hosts[machines[id]] = host
 		}
+		host.sessions++
+		snapshot, ok := snapshots[id]
+		switch {
+		case !ok:
+			host.noSnapshot++
+		case snapshot < version:
+			host.olderSnapshot++
+			if len(host.examples) < 3 {
+				host.examples = append(host.examples, fmt.Sprintf("%s session=%d snapshot=%d", id, version, snapshot))
+			}
+		default:
+			continue
+		}
+		live.missing++
 	}
 	for key := range covered {
 		if !current[key] {
@@ -568,6 +591,28 @@ type usageCoverage struct {
 	deltaDigest string
 	// revisions maps each session to its current snapshot revision.
 	revisions map[string]string
+	// hosts counts each machine's sessions and those without a current
+	// snapshot.
+	hosts map[string]*hostCoverage
+}
+
+// hostCoverage counts one machine's sessions by snapshot state.
+type hostCoverage struct {
+	sessions, noSnapshot, olderSnapshot int
+	// examples name a few sessions whose snapshot is older than the
+	// session, with both versions.
+	examples []string
+}
+
+// describeHosts renders each machine's snapshot coverage for the log.
+func describeHosts(hosts map[string]*hostCoverage) string {
+	var parts []string
+	for _, machine := range slices.Sorted(maps.Keys(hosts)) {
+		h := hosts[machine]
+		parts = append(parts, fmt.Sprintf("%s: %d sessions, %d without a snapshot, %d with an older snapshot %v",
+			machine, h.sessions, h.noSnapshot, h.olderSnapshot, h.examples))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // traceUsageReadiness logs why prepared usage can or cannot answer reads,
