@@ -829,6 +829,11 @@ func chPreparedUsageSourceSQL(state preparedUsageState, where string, whereArgs 
 		query += "\n\t\tUNION ALL\n\t\tSELECT " + chPreparedUsageRowColumns + " FROM usage_delta_rows WHERE " + where
 		args = append(args, whereArgs...)
 	}
+	if len(state.raw) > 0 {
+		query += "\n\t\tUNION ALL\n\t\tSELECT " + chPreparedUsageRowColumns + " FROM (" + chRawHostUsageRowsSQL() + ") WHERE " + where
+		args = append(args, state.pricingDigest)
+		args = append(args, whereArgs...)
+	}
 	return query, args
 }
 
@@ -854,9 +859,9 @@ func chExternalColumn[T ~string](declare func(string, T) func(*ext.Table) error,
 	return declare(name, T(typ))
 }
 
-// withUsageDeltaTables attaches the replaced session list and the prepared
-// delta rows a prepared read's SQL names, when the state has them, to the
-// context the read runs under.
+// withUsageDeltaTables attaches the replaced session list, the raw hosts'
+// session list, and the prepared delta rows a prepared read's SQL names,
+// when the state has them, to the context the read runs under.
 func withUsageDeltaTables(ctx context.Context, state preparedUsageState) (context.Context, error) {
 	if !state.ready {
 		return ctx, nil
@@ -864,6 +869,13 @@ func withUsageDeltaTables(ctx context.Context, state preparedUsageState) (contex
 	var tables []*ext.Table
 	if replaced := state.replaced(); len(replaced) > 0 {
 		table, err := usageSessionListTable("usage_replaced_sessions", replaced)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+	if len(state.raw) > 0 {
+		table, err := usageSessionListTable("usage_raw_host_sessions", state.raw)
 		if err != nil {
 			return nil, err
 		}
@@ -2553,6 +2565,10 @@ var chUsageReadTables = []string{
 	"usage_price_contexts", "model_pricing", "model_pricing_bands", "genai_pricing", "sync_metadata",
 }
 
+// chRawHostUsageTables are the tables a prepared read also reads while some
+// host is read raw; see preparedUsageState.raw.
+var chRawHostUsageTables = []string{"usage_messages", "usage_events"}
+
 // usageReadFingerprint identifies what a usage read depends on. A prepared
 // read depends on the prepared rows, named by the state's stamp, and on the
 // active parts of the tables it joins or prices from; the large message and
@@ -2562,7 +2578,12 @@ func (s *Store) usageReadFingerprint(ctx context.Context, state preparedUsageSta
 	if !state.ready {
 		return s.partsFingerprint(ctx)
 	}
-	fingerprint, err := s.tablePartsFingerprint(ctx, chUsageReadTables)
+	tables := chUsageReadTables
+	if len(state.raw) > 0 {
+		// The raw hosts' rows come from the message and event tables.
+		tables = slices.Concat(tables, chRawHostUsageTables)
+	}
+	fingerprint, err := s.tablePartsFingerprint(ctx, tables)
 	if err != nil {
 		return "", err
 	}

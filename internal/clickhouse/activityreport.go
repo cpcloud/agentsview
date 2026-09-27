@@ -302,6 +302,14 @@ func (s *Store) endedActivityReportRowsKey(
 	if err != nil {
 		return "", err
 	}
+	// The raw hosts' rows come from the message and event tables, which
+	// the prepared digest below does not cover.
+	raw := ""
+	if len(state.raw) > 0 {
+		if raw, err = s.tablePartsFingerprint(ctx, chRawHostUsageTables); err != nil {
+			return "", err
+		}
+	}
 	stored, err := s.readActivityPrepared(ctx, state, lowerBound, upperBound)
 	if err != nil {
 		return "", err
@@ -324,8 +332,8 @@ func (s *Store) endedActivityReportRowsKey(
 	}
 	slices.Sort(delta)
 	delta = slices.Compact(delta)
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%s|%s|%s|%s|%s|%d|%q|%#v|%s|%s|%s|%s|%#v|%v",
-		chPreparedUsageComment(), state.pricingDigest, pricing.digest, pricing.catalog.digest, identity,
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%s|%s|%s|%s|%s|%s|%d|%q|%#v|%s|%s|%s|%s|%#v|%v",
+		chPreparedUsageComment(), state.pricingDigest, pricing.digest, pricing.catalog.digest, identity, raw,
 		storedHash, storedCount, delta, f, q.Timezone,
 		q.RangeStart.UTC().Format(time.RFC3339Nano), q.RangeEnd.UTC().Format(time.RFC3339Nano),
 		q.EffectiveEnd.UTC().Format(time.RFC3339Nano), q.Bucket, q.GapCapSeconds))
