@@ -121,16 +121,24 @@ type preparedUsageState struct {
 	deltaRows [][]any
 	// revisions maps every session with a snapshot to its current snapshot
 	// revision. A ready state's rows for a session are derived from that
-	// snapshot alone, whether stored or in the delta. Shared; not modified.
+	// snapshot alone, whether stored or in the delta. A session of a host
+	// that is not ready maps to "raw:" and its push version instead.
+	// Shared; not modified.
 	revisions map[string]string
+	// raw lists the sessions of the hosts that are not ready: some of
+	// their sessions lack a current snapshot. Reads take these sessions
+	// from the raw message and event tables and every other session from
+	// the prepared rows, so one host that has not published snapshots
+	// does not turn prepared reads off for the others.
+	raw []string
 }
 
 // replaced lists the sessions whose stored prepared rows a read skips: the
-// stale ones, and every one the delta supplies. A refresh that lands after
+// stale ones, the raw hosts' ones, and every one the delta supplies. A refresh that lands after
 // the state was taken may already hold a changed session's rows, and the
 // delta supplies them too.
 func (st preparedUsageState) replaced() []string {
-	ids := slices.Concat(st.changed, st.stale)
+	ids := slices.Concat(st.changed, st.stale, st.raw)
 	slices.Sort(ids)
 	return slices.Compact(ids)
 }
@@ -196,19 +204,26 @@ func (s *Store) preparedUsageState(ctx context.Context) (preparedUsageState, err
 		s.coverageCache.fingerprint, s.coverageCache.stamp, s.coverageCache.live = fingerprint, stamp, live
 		s.coverageCache.mu.Unlock()
 	}
-	if live.missing > 0 {
+	switch {
+	case live.missing == 0:
+		s.traceUsageReadiness("ready (" + describeHosts(live.hosts) + ")")
+	case len(live.raw) > 0:
+		s.traceUsageReadiness(fmt.Sprintf("ready except %d sessions of hosts without complete snapshots, read raw (%s)",
+			len(live.raw), describeHosts(live.hosts)))
+	default:
 		s.traceUsageReadiness(fmt.Sprintf("not ready: %d sessions lack a current usage snapshot (%s)",
 			live.missing, describeHosts(live.hosts)))
-	} else {
-		s.traceUsageReadiness("ready (" + describeHosts(live.hosts) + ")")
 	}
 	state := preparedUsageState{
-		ready:     live.missing == 0,
+		// A host is ready once every one of its sessions has a current
+		// snapshot. The others' sessions are read raw.
+		ready:     live.missing == 0 || len(live.raw) > 0,
 		stamp:     stamp,
 		changed:   live.changed,
 		stale:     live.stale,
 		deltaRows: live.deltaRows,
 		revisions: live.revisions,
+		raw:       live.raw,
 	}
 	// The stored records and the delta's must be under the same digest for
 	// a read to take either in place of the join.
@@ -368,6 +383,31 @@ func (s *Store) compareUsageCoverage(ctx context.Context, covered map[usageSnaps
 			continue
 		}
 		live.missing++
+	}
+	stale := func(host string) bool {
+		h := live.hosts[host]
+		return h.noSnapshot+h.olderSnapshot > 0
+	}
+	if live.missing > 0 && slices.ContainsFunc(slices.Collect(maps.Keys(live.hosts)), func(host string) bool { return !stale(host) }) {
+		raw := map[string]bool{}
+		for id, version := range sessions {
+			if stale(machines[id]) {
+				raw[id] = true
+				live.raw = append(live.raw, id)
+				live.revisions[id] = fmt.Sprintf("raw:%d", version)
+			}
+		}
+		slices.Sort(live.raw)
+		// The raw hosts' sessions take no prepared rows, so none are
+		// prepared for them at read time either.
+		kept := live.changedKeys[:0]
+		for _, key := range live.changedKeys {
+			if !raw[key.id] {
+				kept = append(kept, key)
+			}
+		}
+		live.changedKeys = kept
+		live.changed = slices.DeleteFunc(live.changed, func(id string) bool { return raw[id] })
 	}
 	for key := range covered {
 		if !current[key] {
@@ -594,6 +634,9 @@ type usageCoverage struct {
 	// hosts counts each machine's sessions and those without a current
 	// snapshot.
 	hosts map[string]*hostCoverage
+	// raw lists the sessions of the hosts that are not ready, when at least
+	// one host is.
+	raw []string
 }
 
 // hostCoverage counts one machine's sessions by snapshot state.
